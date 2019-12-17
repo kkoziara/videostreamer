@@ -3,11 +3,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/fcgi"
 	"os"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -24,7 +26,7 @@ type Args struct {
 	ListenHost  string
 	ListenPort  int
 	InputFormat string
-	InputURL    string
+	InputServiceURL    string
 	Verbose     bool
 	// Serve with FCGI protocol (true) or HTTP (false).
 	FCGI bool
@@ -32,8 +34,9 @@ type Args struct {
 
 // HTTPHandler allows us to pass information to our request handlers.
 type HTTPHandler struct {
-	Verbose    bool
-	ClientChan chan<- *Client
+	Verbose         bool
+	ClientChan      chan<- *Client
+	InputServiceURL string
 }
 
 // Client is servicing one HTTP client.
@@ -53,6 +56,9 @@ type Client struct {
 	// Encoder writes packets to this channel, then the packetWriter goroutine
 	// writes them to the pipe.
 	PacketChan chan *C.AVPacket
+
+	// Url of stream used by a client
+	StreamURL string
 }
 
 func main() {
@@ -66,15 +72,16 @@ func main() {
 	// Clients provide encoder info about themselves when they start up.
 	clientChan := make(chan *Client)
 
-	go encoder(args.InputFormat, args.InputURL, args.Verbose, clientChan)
+	go encoder(args.InputFormat, args.Verbose, clientChan)
 
 	// Start serving either with HTTP or FastCGI.
 
 	hostPort := fmt.Sprintf("%s:%d", args.ListenHost, args.ListenPort)
 
 	handler := HTTPHandler{
-		Verbose:    args.Verbose,
-		ClientChan: clientChan,
+		Verbose:         args.Verbose,
+		ClientChan:      clientChan,
+		InputServiceURL: args.InputServiceURL,
 	}
 
 	if args.FCGI {
@@ -106,12 +113,12 @@ func main() {
 
 // getArgs retrieves and validates command line arguments.
 func getArgs() (Args, error) {
-	listenHost := flag.String("host", "0.0.0.0", "Host to listen on.")
+	listenHost := flag.String("host", "127.0.0.1", "Host to listen on.")
 	listenPort := flag.Int("port", 8080, "Port to listen on.")
-	format := flag.String("format", "pulse", "Input format. Example: rtsp for RTSP.")
-	input := flag.String("input", "", "Input URL valid for the given format. For RTSP you can provide a rtsp:// URL.")
+	format := flag.String("format", "rtsp", "Input format. Example: rtsp for RTSP.")
+	input := flag.String("input", "", "Input Service URL. Url to service providing urls for ids in client requests.")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging output.")
-	fcgi := flag.Bool("fcgi", true, "Serve using FastCGI (true) or as a regular HTTP server.")
+	fcgi := flag.Bool("fcgi", false, "Serve using FastCGI (true) or as a regular HTTP server.")
 
 	flag.Parse()
 
@@ -134,31 +141,32 @@ func getArgs() (Args, error) {
 		ListenHost:  *listenHost,
 		ListenPort:  *listenPort,
 		InputFormat: *format,
-		InputURL:    *input,
+		InputServiceURL:    *input,
 		Verbose:     *verbose,
 		FCGI:        *fcgi,
 	}, nil
 }
 
-func encoder(inputFormat, inputURL string, verbose bool,
+func encoder(inputFormat string, verbose bool,
 	clientChan <-chan *Client) {
-	clients := []*Client{}
-	var input *Input
+	clients := map[string][]*Client{}
+
+	inputs := map[string]*Input{}
 
 	for {
 		// If there are no clients, then block waiting for one.
 		if len(clients) == 0 {
 			log.Printf("encoder: Waiting for clients...")
 			client := <-clientChan
-			log.Printf("encoder: New client")
-			clients = append(clients, client)
+			log.Printf("encoder: New client reading %s", client.StreamURL)
+			clients[client.StreamURL] = append(clients[client.StreamURL], client)
 			continue
 		}
 
 		// There is at least one client.
 
 		// Get any new clients, but don't block.
-		clientCountBefore := len(clients)
+		clientCountBefore := len(clients) //TODO: counting not accurate
 		clients = acceptClients(clientChan, clients)
 		clientCountAfter := len(clients)
 
@@ -166,62 +174,71 @@ func encoder(inputFormat, inputURL string, verbose bool,
 			log.Printf("encoder: %d clients", clientCountAfter)
 		}
 
-		// Open the input if it is not open yet.
-		if input == nil {
-			input = openInput(inputFormat, inputURL, verbose)
-			if input == nil {
-				log.Printf("encoder: Unable to open input")
-				cleanupClients(clients)
-				return
+		// iterate over all clients and manage inputs
+
+		keptClients := map[string][]*Client{}
+
+		for streamURL, urlClients := range clients {
+			if inputs[streamURL] == nil {
+				// Open the input if it is not open yet.
+				inputs[streamURL] = openInput(inputFormat, streamURL, verbose)
+				if inputs[streamURL] == nil {
+					log.Printf("encoder: Unable to open input: %s", streamURL)
+					cleanupClients(urlClients)
+					return
+				}
+
+				if verbose {
+					log.Printf("encoder: Opened input")
+				}
+			}
+			// Read a packet.
+			var pkt C.AVPacket
+			readRes := C.int(0)
+			// We might want to lock input here. It's probably not necessary though.
+			// Other goroutines should only be reading it. We're the writer.
+			readRes = C.vs_read_packet(inputs[streamURL].vsInput, &pkt, C.bool(verbose))
+			if readRes == -1 {
+				log.Printf("encoder: Failure reading packet from: %s", streamURL)
+				destroyInput(inputs[streamURL])
+				cleanupClients(urlClients)
+				delete(inputs, streamURL)
+				continue
 			}
 
-			if verbose {
-				log.Printf("encoder: Opened input")
+			if readRes != 0 {
+				// Write the packet to all clients.
+				clientCountBefore = len(clients)
+				urlClients = writePacketToClients(inputs[streamURL], &pkt, urlClients, verbose)
+				clientCountAfter = len(clients)
+
+				if clientCountBefore != clientCountAfter {
+					log.Printf("encoder: %d clients", clientCountAfter)
+				}
+
+				C.av_packet_unref(&pkt)
+
+			}
+
+			// If we get down to zero clients, close the input.
+			if len(urlClients) == 0 {
+				destroyInput(inputs[streamURL])
+				delete(inputs, streamURL)
+				log.Printf("encoder: Closed input: %s", streamURL)
+			} else {
+				keptClients[streamURL] = urlClients
 			}
 		}
 
-		// Read a packet.
-		var pkt C.AVPacket
-		readRes := C.int(0)
-		// We might want to lock input here. It's probably not necessary though.
-		// Other goroutines should only be reading it. We're the writer.
-		readRes = C.vs_read_packet(input.vsInput, &pkt, C.bool(verbose))
-		if readRes == -1 {
-			log.Printf("encoder: Failure reading packet")
-			destroyInput(input)
-			cleanupClients(clients)
-			return
-		}
-
-		if readRes == 0 {
-			continue
-		}
-
-		// Write the packet to all clients.
-		clientCountBefore = len(clients)
-		clients = writePacketToClients(input, &pkt, clients, verbose)
-		clientCountAfter = len(clients)
-
-		if clientCountBefore != clientCountAfter {
-			log.Printf("encoder: %d clients", clientCountAfter)
-		}
-
-		C.av_packet_unref(&pkt)
-
-		// If we get down to zero clients, close the input.
-		if len(clients) == 0 {
-			destroyInput(input)
-			input = nil
-			log.Printf("encoder: Closed input")
-		}
+		clients = keptClients
 	}
 }
 
-func acceptClients(clientChan <-chan *Client, clients []*Client) []*Client {
+func acceptClients(clientChan <-chan *Client, clients map[string][]*Client) map[string][]*Client {
 	for {
 		select {
 		case client := <-clientChan:
-			clients = append(clients, client)
+			clients[client.StreamURL] = append(clients[client.StreamURL], client)
 		default:
 			return clients
 		}
@@ -411,25 +428,66 @@ func openOutput(outputFormat, outputURL string, verbose bool,
 	return output
 }
 
+const streamURLPath = "/streams/"
+
+func getStreamId(url string) string {
+	if idx := strings.Index(url, streamURLPath); idx == 0 {
+		return url[len(streamURLPath):]
+	} else {
+		return ""
+	}
+}
+
 // ServeHTTP handles an HTTP request.
 func (h HTTPHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	log.Printf("Serving [%s] request from [%s] to path [%s] (%d bytes)",
 		r.Method, r.RemoteAddr, r.URL.Path, r.ContentLength)
 
-	if r.Method == "GET" && r.URL.Path == "/stream" {
-		h.streamRequest(rw, r)
-		return
-	}
+	if r.Method == "GET" {
+		if streamId := getStreamId(r.URL.Path); len(streamId) > 0 {
+			streamURL, err := h.getStreamURL(streamId, r.Header.Get("Cookie"))
+			if err == nil {
+				log.Printf("Translated %s stream id to url: %s", streamId, streamURL)
+				h.streamRequest(rw, r, streamURL)
+				return
+			} else {
+				log.Printf("Unable to fetch stream url from input service: %s", err)
+			}
 
-	log.Printf("Unknown request.")
+		} else {
+			log.Printf("Incorrect URL: %s", r.URL.Path)
+		}
+	} else {
+		log.Printf("Incorrect request method.")
+	}
+	
 	rw.WriteHeader(http.StatusNotFound)
 	_, _ = rw.Write([]byte("<h1>404 Not found</h1>"))
+}
+
+func (h HTTPHandler) getStreamURL(streamId, cookie string) (string, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", h.InputServiceURL, streamId), nil)
+    if err != nil {
+        return "", err
+    }
+    req.Header.Set("Cookie", cookie)
+	resp, err := http.DefaultClient.Do(req)
+	
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("Incorrect response status when querying for url: %d", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	return string(body), err
 }
 
 // Read from a pipe where streaming media shows up. We read a chunk and write it
 // immediately to the client, and repeat forever (until either the client goes
 // away, or an error of some kind occurs).
-func (h HTTPHandler) streamRequest(rw http.ResponseWriter, r *http.Request) {
+func (h HTTPHandler) streamRequest(rw http.ResponseWriter, r *http.Request, streamURL string) {
 	// The encoder writes to the out pipe (using the packetWriter goroutine). We
 	// read from the in pipe.
 	inPipe, outPipe, err := os.Pipe()
@@ -441,8 +499,9 @@ func (h HTTPHandler) streamRequest(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &Client{
-		mutex:   &sync.RWMutex{},
-		OutPipe: outPipe,
+		mutex:     &sync.RWMutex{},
+		OutPipe:   outPipe,
+		StreamURL: streamURL,
 	}
 
 	// Tell the encoder we're here.
